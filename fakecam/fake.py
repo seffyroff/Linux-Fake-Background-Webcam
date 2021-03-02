@@ -29,23 +29,62 @@ def findFile(pattern, path):
                 return os.path.join(root, name)
     return None
 
+def get_codec_args_from_string(codec):
+    return (char for char in codec)
+
+
+def _log_camera_property_not_set(prop, value):
+    print("Cannot set camera property {} to {}. "
+          "Defaulting to auto-detected property set by opencv".format(prop, value))
+
+
 class RealCam:
-    def __init__(self, src, frame_width, frame_height, frame_rate):
+    def __init__(self, src, frame_width, frame_height, frame_rate, codec):
         self.cam = cv2.VideoCapture(src, cv2.CAP_V4L2)
         self.stopped = False
         self.frame = None
         self.lock = threading.Lock()
-        self._set_prop(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
-        self._set_prop(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
-        self._set_prop(cv2.CAP_PROP_FPS, frame_rate)
+        self.get_camera_values("original")
+        c1, c2, c3, c4 = get_codec_args_from_string(codec)
+        self._set_codec(cv2.VideoWriter_fourcc(c1, c2, c3, c4))
+        self._set_frame_dimensions(frame_width, frame_height)
+        self._set_frame_rate(frame_rate)
+        self.get_camera_values("new")
 
-    def _set_prop(self, prop, value):
-        if self.cam.set(prop, value):
-            if value == self.cam.get(prop):
-                return True
+    def get_camera_values(self, status):
+        print(
+            "Real camera {} values are set as: {}x{} with {} FPS and video codec {}".format(
+                status,
+                self.get_frame_width(),
+                self.get_frame_height(),
+                self.get_frame_rate(),
+                self.get_codec()
+            )
+        )
 
-        print("Cannot set camera property {} to {}, used value: {}".format(prop, value, self.cam.get(prop)))
-        return False
+    def _set_codec(self, codec):
+        self.cam.set(cv2.CAP_PROP_FOURCC, codec)
+        if codec != self.get_codec():
+            _log_camera_property_not_set(cv2.CAP_PROP_FOURCC, codec)
+
+    def _set_frame_dimensions(self, width, height):
+        # width/height need to both be set before checking for any errors.
+        # If either are checked before setting both, either can be reported as not set properly
+        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        if width != self.get_frame_width():
+            _log_camera_property_not_set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        if height != self.get_frame_height():
+            _log_camera_property_not_set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    def _set_frame_rate(self, fps):
+        self.cam.set(cv2.CAP_PROP_FPS, fps)
+        if fps != self.get_frame_rate():
+            _log_camera_property_not_set(cv2.CAP_PROP_FPS, fps)
+
+    def get_codec(self):
+        return int(self.cam.get(cv2.CAP_PROP_FOURCC))
 
     def get_frame_width(self):
         return int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -85,9 +124,11 @@ class FakeCam:
         fps: int,
         width: int,
         height: int,
+        codec: str,
         scale_factor: float,
         no_background: bool,
         background_blur: int,
+        background_keep_aspect: bool,
         use_foreground: bool,
         hologram: bool,
         tiling: bool,
@@ -105,11 +146,12 @@ class FakeCam:
         self.hologram = hologram
         self.tiling = tiling
         self.background_blur = background_blur
+        self.background_keep_aspect = background_keep_aspect
         self.background_image = background_image
         self.foreground_image = foreground_image
         self.foreground_mask_image = foreground_mask_image
         self.scale_factor = scale_factor
-        self.real_cam = RealCam(webcam_path, width, height, fps)
+        self.real_cam = RealCam(webcam_path, width, height, fps, codec)
         # In case the real webcam does not support the requested mode.
         self.width = self.real_cam.get_frame_width()
         self.height = self.real_cam.get_frame_height()
@@ -140,7 +182,7 @@ class FakeCam:
         _, data = cv2.imencode(".png", frame)
         #print("Posting to " + self.bodypix_url)
         async with session.post(
-            url=self.bodypix_url, data=data.tostring(),
+            url=self.bodypix_url, data=data.tobytes(),
             headers={"Content-Type": "application/octet-stream"}
         ) as r:
             mask = np.frombuffer(await r.read(), dtype=np.uint8)
@@ -166,6 +208,22 @@ class FakeCam:
             img[:, dx:] = 0
         return img
 
+    """Rescale image to dimensions self.width, self.height. If keep_aspect is True
+then scale & crop the image so that its pixels retain their aspect ratio."""
+    def resize_image(self, img, keep_aspect):
+        if self.width==0 or self.height==0:
+            raise RuntimeError("Camera dimensions error w={} h={}".format(self.width, self.height))
+        if keep_aspect:
+            imgheight, imgwidth,=img.shape[:2]
+            scale=max(self.width/imgwidth, self.height/imgheight)
+            newimgwidth, newimgheight=int(np.floor(self.width/scale)), int(np.floor(self.height/scale))
+            ix0=int(np.floor(0.5*imgwidth-0.5*newimgwidth))
+            iy0=int(np.floor(0.5*imgheight-0.5*newimgheight))
+            img = cv2.resize(img[iy0:iy0+newimgheight, ix0:ix0+newimgwidth, :], (self.width, self.height))
+        else:
+            img = cv2.resize(img, (self.width, self.height))
+        return img
+
     async def load_images(self):
         async with self.image_lock:
             self.images: Dict[str, Any] = {}
@@ -173,7 +231,7 @@ class FakeCam:
             background = cv2.imread(self.background_image)
             if background is not None:
                 if not self.tiling:
-                    background = cv2.resize(background, (self.width, self.height))
+                    background = self.resize_image(background, self.background_keep_aspect)
                 else:
                     sizey, sizex = background.shape[0], background.shape[1]
                     if sizex > self.width and sizey > self.height:
@@ -186,6 +244,8 @@ class FakeCam:
                 background = itertools.repeat(background)
             else:
                 background_video = cv2.VideoCapture(self.background_image)
+                if not background_video.isOpened():
+                    raise RuntimeError("Couldn't open video '{}'".format(self.background_image))
                 self.bg_video_fps = background_video.get(cv2.CAP_PROP_FPS)
                 # Initiate current fps to background video fps
                 self.current_fps = self.bg_video_fps
@@ -195,11 +255,16 @@ class FakeCam:
                             background_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
                             ret, frame = background_video.read()
                             assert ret, 'cannot read frame %r' % self.background_image
-                        frame = cv2.resize(frame, (self.width, self.height))
-                        return frame
+                        return self.resize_image(frame, self.background_keep_aspect)
                 def next_frame():
                     while True:
-                        self.bg_video_adv_rate = round(self.bg_video_fps/self.current_fps)
+                        advrate=self.bg_video_fps/self.current_fps # Number of frames we need to advance background movie. Fractional.
+                        if advrate<1:
+                            # Number of frames<1 so to avoid movie freezing randomly choose whether to advance by one frame with correct probability.
+                            self.bg_video_adv_rate=1 if np.random.uniform()<advrate else 0
+                        else:
+                            # Just round to nearest number of frames when >=1.
+                            self.bg_video_adv_rate = round(advrate)
                         for i in range(self.bg_video_adv_rate):
                             frame = read_frame();
                         yield frame
@@ -315,6 +380,8 @@ def parse_args():
                         help="Set real webcam height")
     parser.add_argument("-F", "--fps", default=30, type=int,
                         help="Set real webcam FPS")
+    parser.add_argument("-C", "--codec", default='MJPG', type=str,
+                        help="Set real webcam codec")
     parser.add_argument("-S", "--scale-factor", default=0.5, type=float,
                         help="Scale factor of the image sent to BodyPix network")
     parser.add_argument("-B", "--bodypix-url", default="http://127.0.0.1:9000",
@@ -336,6 +403,8 @@ def parse_args():
                         help="Disable background image, blurry background")
     parser.add_argument("--background-blur", default="25", type=int,
                         help="Set background blur level")
+    parser.add_argument("--background-keep-aspect", action="store_true",
+                        help="Crop background if needed to maintain aspect ratio")
     parser.add_argument("--no-foreground", action="store_true",
                         help="Disable foreground image")
     parser.add_argument("-f", "--foreground-image", default="foreground.*",
@@ -369,9 +438,11 @@ def main():
         fps=args.fps,
         width=args.width,
         height=args.height,
+        codec=args.codec,
         scale_factor=args.scale_factor,
         no_background=args.no_background,
         background_blur=getNextOddNumber(args.background_blur),
+        background_keep_aspect=args.background_keep_aspect,
         use_foreground=not args.no_foreground,
         hologram=args.hologram,
         tiling=args.tile_background,
