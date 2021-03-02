@@ -12,6 +12,7 @@ WORKDIR /src
 COPY foreground.jpg \
     foreground-mask.png \
     background.jpg \
+    space_station_bg.mp4 \
     fake.py \
     akvcam.py \
     requirements.txt \
